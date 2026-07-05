@@ -7,7 +7,6 @@ Run with:  streamlit run app.py
 from pathlib import Path
 import sys
 import traceback
-import inspect
 
 import numpy as np
 import pandas as pd
@@ -21,30 +20,6 @@ from pipeline import run_pipeline  # noqa: E402
 st.set_page_config(page_title="FIFA World Cup 2026 Dashboard", layout="wide", page_icon="⚽")
 
 RAW_PATH = Path(__file__).parent / "raw_data"
-
-# ------------------------------------------------------------------
-# Version-adaptive st.plotly_chart wrapper.
-# Newer Streamlit uses width="stretch"; older Streamlit only knows
-# use_container_width=True and treats any unrecognized keyword as a
-# legacy Plotly config override (hence the "keyword arguments have been
-# deprecated... use `config` instead" warning on every single chart).
-# This checks the installed version once and always passes the
-# argument that version actually supports.
-# ------------------------------------------------------------------
-_original_plotly_chart = st.plotly_chart
-_plotly_chart_params = set(inspect.signature(_original_plotly_chart).parameters)
-
-
-def _plotly_chart_compat(fig, *args, **kwargs):
-    if "width" in _plotly_chart_params:
-        kwargs.setdefault("width", "stretch")
-    else:
-        kwargs.pop("width", None)
-        kwargs.setdefault("use_container_width", True)
-    return _original_plotly_chart(fig, *args, **kwargs)
-
-
-st.plotly_chart = _plotly_chart_compat
 
 # ============================================================
 # THEME — navy / gold, stadium-scoreboard inspired
@@ -273,12 +248,13 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-kc = st.columns(5)
+kc = st.columns(6)
 kpi_card(kc[0], "Matches Played", kpis["Matches Played"])
-kpi_card(kc[1], "Total Goals", kpis["Goals"])
-kpi_card(kc[2], "Goals / Match", kpis["Goals per Match"])
-kpi_card(kc[3], "Teams", kpis["Teams"])
-kpi_card(kc[4], "Avg xG", kpis["Average xG"] if kpis["Average xG"] is not None else "—")
+kpi_card(kc[1], "Upcoming", kpis.get("Upcoming Matches", 0))
+kpi_card(kc[2], "Total Goals", kpis["Goals"])
+kpi_card(kc[3], "Goals / Match", kpis["Goals per Match"])
+kpi_card(kc[4], "Teams", kpis["Teams"])
+kpi_card(kc[5], "Avg xG", kpis["Average xG"] if kpis["Average xG"] is not None else "—")
 
 st.write("")
 
@@ -404,11 +380,12 @@ def render_stages():
     badge = '<span class="badge-done">Completed</span>' if p["is_completed"] else '<span class="badge-live">Ongoing</span>'
     st.markdown(f"### {selected_stage} &nbsp; {badge}", unsafe_allow_html=True)
 
-    sc = st.columns(4)
+    sc = st.columns(5)
     kpi_card(sc[0], "Teams Involved", p["teams"])
-    kpi_card(sc[1], "Matches Played", p["matches"])
+    kpi_card(sc[1], "Matches Played", f"{p['matches_played']} / {p['matches']}")
     kpi_card(sc[2], "Goals Scored", p["goals"] if p["goals"] is not None else "—")
     kpi_card(sc[3], "Advancing", p["advancing_teams"] if p["advancing_teams"] is not None else "Final stage")
+    kpi_card(sc[4], "Upcoming", p["matches"] - p["matches_played"])
 
     stage_matches = stage_progression["matches_by_stage"][selected_stage]
     show_cols = [c for c in ["date", "home_team_name", "away_team_name", "scoreline",

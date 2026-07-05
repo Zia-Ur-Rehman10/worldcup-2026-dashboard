@@ -120,6 +120,32 @@ Two options, in order of effort:
 All of this recomputes automatically the same way the basic KPIs do —
 change your raw CSVs, refresh, done.
 
+## Handling a live, in-progress tournament
+
+Now that the real World Cup 2026 is underway, `matches.csv` contains a
+mix of played matches and future fixtures (with `NaN` scores) — and
+knockout matches can be decided by penalty shootouts. The pipeline
+accounts for both:
+
+- **Upcoming fixtures** are tracked separately (`is_played` flag) and
+  excluded from every team stat, standings table, and style-cluster
+  calculation — they're never silently treated as 0-0 draws. The
+  Overview KPIs show an "Upcoming" count, and the Tournament Stages tab
+  shows played-vs-scheduled counts per stage.
+- **Penalty shootouts** are read from `home_penalty_score` /
+  `away_penalty_score` — a knockout match level after normal time is
+  correctly credited to the shootout winner, not recorded as a draw.
+- **Stage order** is derived from `stage_id`, not match dates — dates
+  aren't reliable for phase ordering (rescheduling, weather delays,
+  etc. can put an earlier-dated match in a later phase).
+
+Two extra files sometimes appear in the Kaggle dataset —
+`matches_detailed.csv` and `player_stats.csv`. They're loaded but not
+currently used by any chart (the pipeline only reads the specific
+files it needs). If you want player ratings/shot data from
+`player_stats.csv` wired into the Players tab once Kaggle populates it
+with real values, that's a small addition — just ask.
+
 ## Extending the pipeline
 
 `src/pipeline.py` mirrors your notebook's stages:
@@ -139,11 +165,100 @@ it. Each function is defensive about missing columns (e.g. `home_xg`),
 same pattern your notebook already used for the district shapefile
 detection in your other project.
 
-## Deploying (optional)
+## Deployed
 
-To share this like your R/Shiny "Departure for Development" dashboard:
-push this folder to GitHub and deploy on **Streamlit Community Cloud**
-(streamlit.io/cloud) — free, connects directly to a GitHub repo. If
-your raw data changes often, commit updated CSVs to the repo and the
-cloud app picks them up on the next deploy/rerun the same way it does
-locally.
+Live at: **https://fifa-worldcup-2026-dashboard.streamlit.app/**
+
+It's deployed via Streamlit Community Cloud, connected to
+`github.com/Zia-Ur-Rehman10/worldcup-2026-dashboard`. Any push to
+`main` auto-redeploys within about a minute.
+
+## Fully automated updates (no manual git push)
+
+Your data source is the Kaggle dataset
+[mominullptr/fifa-world-cup-2026-dataset](https://www.kaggle.com/datasets/mominullptr/fifa-world-cup-2026-dataset) —
+so instead of Colab → Drive → manual download → paste into `raw_data/`,
+`scripts/fetch_data.py` pulls it directly via the official Kaggle API,
+and GitHub Actions runs that on a schedule and pushes updates automatically.
+
+### How it works
+
+1. **`scripts/fetch_data.py`** — authenticates with Kaggle, downloads
+   and unzips the dataset, then copies every CSV into `raw_data/` —
+   but only overwrites a file if its contents actually changed, so you
+   don't get noise commits every time the schedule fires.
+
+2. **`scripts/validate_data.py`** — runs the *entire* dashboard
+   pipeline against the freshly-fetched data before anything gets
+   committed. If the upstream dataset changes a column name, drops a
+   file, or introduces bad data — anything that would break the live
+   dashboard — this catches it and prints exactly what broke and
+   where.
+
+3. **`.github/workflows/update_data.yml`** — runs on a schedule (daily
+   at 06:00 UTC by default): fetch → validate → only if validation
+   passes, commit and push. If validation fails, the workflow **rolls
+   back to the last known-good `raw_data/`** and fails loudly (you'll
+   get a GitHub notification) instead of silently pushing data that
+   would break your live dashboard.
+
+4. **Streamlit Community Cloud** already watches your repo's `main`
+   branch and redeploys on every push — so once the Action pushes new
+   (validated) data, your live dashboard updates within about a minute.
+
+This closes the loop on the exact failure mode you hit manually:
+before, a schema change from Kaggle would go straight to production
+and break the dashboard. Now it gets caught and blocked automatically.
+
+### One-time setup: Kaggle API token
+
+You're already using this exact method in your Colab notebook — you
+just need to give GitHub Actions the same token.
+
+1. Go to **[kaggle.com/settings](https://www.kaggle.com/settings)** →
+   scroll to the **API** section → click **Create New Token** (or, if
+   you're rotating the one that was previously exposed, click
+   **Expire Token** first, then create a new one). Kaggle will show
+   you a token string starting with `KGAT_...` — copy it.
+2. On GitHub, go to your repo → **Settings → Secrets and variables →
+   Actions → New repository secret**. Add exactly **one** secret:
+   - Name: `KAGGLE_API_TOKEN`
+   - Value: your `KGAT_...` token
+3. To test locally first (optional but recommended before relying on
+   the schedule):
+   ```bash
+   export KAGGLE_API_TOKEN=your_token_here
+   pip install -r scripts/requirements.txt
+   python scripts/fetch_data.py
+   python scripts/validate_data.py
+   ```
+   You should see each CSV reported as "updated" or "no changes,"
+   followed by `VALIDATION PASSED`.
+
+**Security note:** never commit a Kaggle token directly into a
+notebook or any file in the repo — that's exactly what happened
+previously and the exposed token should be expired via "Expire Token"
+on the Kaggle settings page above. GitHub Secrets (used here) are
+encrypted and never appear in logs or the repo itself.
+
+### Running it
+
+- **On schedule**: happens automatically once the secret is set —
+  nothing more to do.
+- **On demand**: GitHub repo → **Actions** tab → "Auto-update World Cup
+  data" → **Run workflow**, to trigger it immediately instead of
+  waiting for the schedule.
+- **Change the frequency**: edit the `cron:` line in
+  `.github/workflows/update_data.yml` (cron times are always UTC).
+- **If it fails**: check the **Actions** tab → click the failed run →
+  read the `validate_data.py` output. It tells you exactly which
+  column or file changed. Your live dashboard keeps running on the
+  last good data the whole time — a failed update never takes the
+  site down.
+
+### Before the secret is added
+
+The workflow will run on schedule but fail at the fetch step with an
+authentication error — this is expected and won't affect your live
+dashboard or existing data, it just means new data won't be pulled in
+until the secret above is configured.
