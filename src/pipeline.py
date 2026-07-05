@@ -110,21 +110,57 @@ def build_master_matches(_dataframes: dict, version: str) -> pd.DataFrame:
         .merge(referees, on="referee_id", how="left")
     )
 
-    # --- Basic match features ---
+    # --- Guard against merge mismatches (e.g. a stale teams.csv missing a
+    # team_id that a newer matches.csv references) blowing up downstream
+    # string concatenation. Falling back to a clear placeholder instead of
+    # NaN means "Unknown Team" appears in a table rather than the whole
+    # pipeline crashing on `NaN + str`. ---
+    for col in ["home_team_name", "away_team_name"]:
+        if col in mm.columns and mm[col].isna().any():
+            mm[col] = mm[col].fillna("Unknown Team")
+
+    # --- Played vs. upcoming: a real, live tournament's matches.csv mixes
+    # completed results with future fixtures (NaN scores). Every stat below
+    # must be computed only from matches that have actually been played. ---
+    mm["is_played"] = mm["home_score"].notna() & mm["away_score"].notna()
+    if "status" in mm.columns:
+        # Belt-and-suspenders: also respect an explicit status column if
+        # the dataset provides one, in case scores are backfilled early.
+        mm["is_played"] = mm["is_played"] & (mm["status"] != "Postponed")
+
+    # --- Penalty shootout awareness: a knockout match level after 90/120
+    # minutes is NOT a draw if it was decided on penalties. ---
+    has_penalties = "home_penalty_score" in mm.columns and "away_penalty_score" in mm.columns
+    if has_penalties:
+        mm["decided_on_penalties"] = mm["home_penalty_score"].notna() & mm["away_penalty_score"].notna()
+    else:
+        mm["decided_on_penalties"] = False
+
+    # --- Basic match features (computed for played matches; NaN/False for
+    # upcoming fixtures rather than silently coded as 0-0 draws) ---
     mm["total_goals"] = mm["home_score"] + mm["away_score"]
     mm["goal_difference"] = (mm["home_score"] - mm["away_score"]).abs()
-    mm["home_win"] = mm["home_score"] > mm["away_score"]
-    mm["away_win"] = mm["away_score"] > mm["home_score"]
-    mm["draw"] = mm["home_score"] == mm["away_score"]
 
-    def get_winner(row):
-        if row.home_score > row.away_score:
-            return row.home_team_name
-        elif row.home_score < row.away_score:
-            return row.away_team_name
-        return "Draw"
+    def resolve_outcome(row):
+        """Returns (home_win, away_win, draw, winner_name) accounting for
+        penalty shootouts. Unplayed fixtures return all-False / None."""
+        if not row["is_played"]:
+            return False, False, False, None
+        if row["home_score"] > row["away_score"]:
+            return True, False, False, row["home_team_name"]
+        if row["home_score"] < row["away_score"]:
+            return False, True, False, row["away_team_name"]
+        # Scores level — check for a penalty shootout before calling it a draw
+        if row["decided_on_penalties"]:
+            if row["home_penalty_score"] > row["away_penalty_score"]:
+                return True, False, False, row["home_team_name"]
+            elif row["away_penalty_score"] > row["home_penalty_score"]:
+                return False, True, False, row["away_team_name"]
+        return False, False, True, "Draw"
 
-    mm["winner"] = mm.apply(get_winner, axis=1)
+    outcomes = mm.apply(resolve_outcome, axis=1, result_type="expand")
+    outcomes.columns = ["home_win", "away_win", "draw", "winner"]
+    mm[["home_win", "away_win", "draw", "winner"]] = outcomes
 
     # --- xG features (guarded — some datasets omit xG until later stages) ---
     if "home_xg" in mm.columns and "away_xg" in mm.columns:
@@ -148,6 +184,8 @@ def build_master_matches(_dataframes: dict, version: str) -> pd.DataFrame:
         mm["favorite"] = mm.apply(favorite, axis=1)
 
     def goal_category(g):
+        if pd.isna(g):
+            return "Not Played"
         if g == 0:
             return "0 Goals"
         elif g <= 2:
@@ -161,16 +199,18 @@ def build_master_matches(_dataframes: dict, version: str) -> pd.DataFrame:
     if "is_knockout" in mm.columns:
         mm["knockout_match"] = mm["is_knockout"].map({True: "Yes", False: "No"})
 
-    mm["home_clean_sheet"] = mm["away_score"] == 0
-    mm["away_clean_sheet"] = mm["home_score"] == 0
+    mm["home_clean_sheet"] = mm["is_played"] & (mm["away_score"] == 0)
+    mm["away_clean_sheet"] = mm["is_played"] & (mm["home_score"] == 0)
 
-    mm["scoreline"] = (
-        mm["home_team_name"] + " "
-        + mm["home_score"].fillna(0).astype(int).astype(str)
-        + "\u2013"
-        + mm["away_score"].fillna(0).astype(int).astype(str)
-        + " " + mm["away_team_name"]
-    )
+    def format_scoreline(row):
+        if not row["is_played"]:
+            return f"{row['home_team_name']} vs {row['away_team_name']} (Upcoming)"
+        line = f"{row['home_team_name']} {int(row['home_score'])}\u2013{int(row['away_score'])} {row['away_team_name']}"
+        if row["decided_on_penalties"]:
+            line += f" (pens {int(row['home_penalty_score'])}\u2013{int(row['away_penalty_score'])})"
+        return line
+
+    mm["scoreline"] = mm.apply(format_scoreline, axis=1)
 
     return mm
 
@@ -341,10 +381,12 @@ def build_event_mart(match_events: pd.DataFrame, teams: pd.DataFrame, version: s
 def build_kpis(master_matches: pd.DataFrame, teams: pd.DataFrame, venues: pd.DataFrame,
                 version: str) -> dict:
     mm = master_matches
-    completed = mm[mm["status"] == "Completed"] if "status" in mm.columns else mm
+    completed = mm[mm["is_played"]] if "is_played" in mm.columns else mm
+    upcoming = mm[~mm["is_played"]] if "is_played" in mm.columns else mm.iloc[0:0]
 
     kpi = {}
     kpi["Matches Played"] = len(completed)
+    kpi["Upcoming Matches"] = len(upcoming)
     kpi["Goals"] = int(completed["home_score"].sum() + completed["away_score"].sum())
     kpi["Goals per Match"] = round(kpi["Goals"] / max(kpi["Matches Played"], 1), 2)
     kpi["Teams"] = teams["team_name"].nunique()
@@ -864,11 +906,21 @@ def build_group_standings(master_matches: pd.DataFrame, version: str) -> pd.Data
 @st.cache_data(show_spinner=False)
 def build_stage_progression(master_matches: pd.DataFrame, version: str) -> dict:
     mm = master_matches
-    if "stage_name" not in mm.columns or "date" not in mm.columns:
+    if "stage_name" not in mm.columns:
         return {}
 
-    stage_dates = mm.groupby("stage_name")["date"].min().sort_values()
-    stage_order = stage_dates.index.tolist()
+    # Order stages by stage_id — that's what actually encodes tournament
+    # phase order. Match dates are NOT reliable for this: rescheduling,
+    # weather delays, or knockout legs played out of strict date sequence
+    # can all make "earliest match date per stage" lie about real order.
+    if "stage_id" in mm.columns:
+        stage_order_map = mm.groupby("stage_name")["stage_id"].min().sort_values()
+        stage_order = stage_order_map.index.tolist()
+    elif "date" in mm.columns:
+        stage_dates = mm.groupby("stage_name")["date"].min().sort_values()
+        stage_order = stage_dates.index.tolist()
+    else:
+        return {}
 
     teams_by_stage = {}
     for stage in stage_order:
@@ -883,13 +935,15 @@ def build_stage_progression(master_matches: pd.DataFrame, version: str) -> dict:
         eliminated = participants - advancing if next_stage else set()
 
         stage_mm = mm[mm["stage_name"] == stage]
-        completed = (stage_mm["status"] == "Completed").all() if "status" in stage_mm.columns else True
+        completed = stage_mm["is_played"].all() if "is_played" in stage_mm.columns else True
+        matches_played = int(stage_mm["is_played"].sum()) if "is_played" in stage_mm.columns else len(stage_mm)
 
         progression_rows.append({
             "stage": stage,
             "order": i,
             "teams": len(participants),
             "matches": len(stage_mm),
+            "matches_played": matches_played,
             "goals": int(stage_mm["total_goals"].sum()) if "total_goals" in stage_mm.columns else None,
             "advancing_teams": len(advancing) if next_stage else None,
             "eliminated_teams": sorted(eliminated) if next_stage else [],
@@ -919,9 +973,17 @@ def run_pipeline(raw_path: str):
     dataframes = load_raw_data(raw_path, version)
 
     master_matches = build_master_matches(dataframes, version)
-    team_summary = build_team_summary(master_matches, dataframes["teams"], version)
+
+    # Team-level stats, standings, and clustering must only ever see matches
+    # that have actually been played — not future fixtures with NaN scores.
+    # `master_matches` (full schedule, played + upcoming) is still returned
+    # separately below for the Tournament Stages / fixtures view.
+    played_matches = master_matches[master_matches["is_played"]].copy() \
+        if "is_played" in master_matches.columns else master_matches
+
+    team_summary = build_team_summary(played_matches, dataframes["teams"], version)
     team_match_mart = build_team_match_mart(
-        master_matches, dataframes["match_team_stats"], dataframes["teams"], version
+        played_matches, dataframes["match_team_stats"], dataframes["teams"], version
     )
     event_mart = build_event_mart(dataframes["match_events"], dataframes["teams"], version)
     kpis = build_kpis(master_matches, dataframes["teams"], dataframes["venues"], version)
@@ -930,11 +992,11 @@ def run_pipeline(raw_path: str):
     # Advanced analytics layer
     team_intelligence = build_team_intelligence(team_match_mart, version)
     team_summary_v2 = build_team_summary_v2(team_match_mart, dataframes["teams"], version)
-    match_summary = build_match_summary(master_matches, dataframes["match_team_stats"], version)
+    match_summary = build_match_summary(played_matches, dataframes["match_team_stats"], version)
     goal_timing = build_goal_timing(event_mart, version)
     player_summary = build_player_summary(dataframes, event_mart, version)
-    advanced_insights = build_advanced_insights(master_matches, team_summary_v2, team_match_mart, event_mart, version)
-    group_standings = build_group_standings(master_matches, version)
+    advanced_insights = build_advanced_insights(played_matches, team_summary_v2, team_match_mart, event_mart, version)
+    group_standings = build_group_standings(played_matches, version)
     stage_progression = build_stage_progression(master_matches, version)
 
     return {
