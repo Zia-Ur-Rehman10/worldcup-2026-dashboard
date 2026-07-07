@@ -73,6 +73,45 @@ Two options, in order of effort:
    own schedule. The pipeline will pick it up next time the app runs
    or auto-refreshes — you don't need to touch `pipeline.py`.
 
+## What's new (latest data refresh)
+
+Your latest Kaggle pull added real venue geography, referee bios, and a
+much richer player-stats file. Wired in:
+
+- **Venues & Referees tab** — a real map of host stadiums (using actual
+  lat/long), elevation vs. goals-per-match (does Mexico City's ~2,200m
+  altitude show up in the numbers?), capacity comparison, and referee
+  discipline: actual cards issued this tournament vs. each referee's
+  pre-tournament expected average.
+- **Match Factors tab** — uses `match_prediction_features.csv` (squad
+  value, rest days, host-nation flag, pre-match Elo/rank) to explore
+  what actually correlates with winning: does higher squad value
+  predict the result? Does a host nation win more at home than other
+  teams do? Where are the Elo-favorite upsets?
+- **Player of the Match leaderboard, age distribution, height-by-position,
+  and club representation** — added to the Players tab, using the new
+  `date_of_birth`, `height_cm`, and `club_team` columns in
+  `squads_and_players.csv`.
+- **`player_stats.csv` is now the primary source** for player goals/
+  assists/cards/minutes (previously derived from `match_lineups` +
+  `match_events`, which is kept as a fallback if `player_stats.csv`
+  isn't present in a given data snapshot).
+
+Two bugs found and fixed while integrating this:
+- `venues.csv` and `referees.csv` both introduced a `country` column,
+  which would have silently collided into `country_x`/`country_y` on
+  merge. Both are now renamed explicitly (`venue_country` /
+  `referee_country`) before merging.
+- Some `match_events.csv` rows use stoppage-time notation like `"90+6"`
+  in the `minute` column, which silently turned the entire column into
+  text and broke every numeric comparison downstream (goal timing,
+  insights). Now parsed into a proper number (`90+6` → `96`) up front.
+- Some future knockout fixtures (e.g. Quarter-final slots depending on
+  an unplayed Round of 16 match) have no team assigned yet in the
+  source data. These are now labeled "TBD" and excluded from team/
+  participant counts — previously they'd have been miscounted as an
+  extra "team."
+
 ## What's in the advanced version
 
 - **Professional visual theme** — navy/gold stadium-scoreboard styling: a

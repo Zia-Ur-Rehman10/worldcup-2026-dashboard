@@ -235,6 +235,9 @@ kpis = data["kpis"]
 advanced_insights = data["advanced_insights"]
 group_standings = data["group_standings"]
 stage_progression = data["stage_progression"]
+venue_analysis = data["venue_analysis"]
+referee_analysis = data["referee_analysis"]
+match_factors = data["match_factors"]
 
 has_style = "Playing_Style" in team_summary_v2.columns
 
@@ -272,6 +275,10 @@ st.write("")
 # ============================================================
 tab_names = ["Overview", "Tournament Stages", "Team Intelligence", "Style Map",
              "Match Excitement", "Goal Timing", "Head-to-Head", "Matches"]
+if not venue_analysis.empty or not referee_analysis.empty:
+    tab_names.append("Venues & Referees")
+if not match_factors.empty:
+    tab_names.append("Match Factors")
 if not player_summary.empty:
     tab_names.append("Players")
 
@@ -764,6 +771,147 @@ with tab_map["Matches"]:
     safe_section("Matches", render_matches)
 
 
+# ============================= VENUES & REFEREES =============================
+if "Venues & Referees" in tab_map:
+    def render_venues_referees():
+        if not venue_analysis.empty:
+            section_header("Venue Geography & Elevation")
+            st.caption("Real stadium coordinates, capacity, and elevation — including altitude effects "
+                       "like Mexico City's ~2,200m, which is known to affect stamina and finishing.")
+
+            if {"latitude", "longitude"}.issubset(venue_analysis.columns):
+                fig = px.scatter_geo(
+                    venue_analysis, lat="latitude", lon="longitude", size="Matches",
+                    color="Goals_per_Match", hover_name="stadium_name",
+                    hover_data={"city": True, "capacity": True, "elevation_meters": True},
+                    projection="natural earth", title="Host Venues (bubble size = matches played)",
+                    color_continuous_scale="Blues",
+                )
+                fig.update_geos(scope="north america", showcountries=True)
+                fig.update_layout(height=500)
+                st.plotly_chart(fig, width="stretch")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if "elevation_meters" in venue_analysis.columns:
+                    fig = px.scatter(
+                        venue_analysis, x="elevation_meters", y="Goals_per_Match", size="Matches",
+                        hover_name="stadium_name", trendline="ols",
+                        title="Elevation vs Goals per Match",
+                    )
+                    st.plotly_chart(fig, width="stretch")
+                    st.caption("Higher elevation is linked to thinner air and faster player fatigue — "
+                               "watch whether Mexico City-altitude venues cluster differently here.")
+            with c2:
+                if "capacity" in venue_analysis.columns:
+                    fig = px.bar(venue_analysis.sort_values("capacity", ascending=False),
+                                x="stadium_name", y="capacity", color="Goals_per_Match",
+                                title="Stadium Capacity")
+                    fig.update_layout(xaxis_tickangle=-40)
+                    st.plotly_chart(fig, width="stretch")
+
+            st.dataframe(
+                venue_analysis[[c for c in ["stadium_name", "city", "venue_country", "capacity",
+                                              "elevation_meters", "Matches", "Goals", "Goals_per_Match"]
+                                if c in venue_analysis.columns]].round(2),
+                width="stretch", hide_index=True,
+            )
+
+        if not referee_analysis.empty:
+            st.divider()
+            section_header("Referee Discipline")
+            st.caption("Actual cards issued per referee vs. their pre-tournament expected average.")
+
+            c3, c4 = st.columns(2)
+            with c3:
+                if "Actual_Cards_per_Game" in referee_analysis.columns:
+                    fig = px.bar(referee_analysis.sort_values("Actual_Cards_per_Game", ascending=False).head(15),
+                                x="referee_name", y="Actual_Cards_per_Game", color="Actual_Cards_per_Game",
+                                title="Most Card-Happy Referees (this tournament)")
+                    fig.update_layout(xaxis_tickangle=-40)
+                    st.plotly_chart(fig, width="stretch")
+            with c4:
+                if {"Actual_Cards_per_Game", "Expected_Cards_per_Game"}.issubset(referee_analysis.columns):
+                    fig = px.scatter(
+                        referee_analysis, x="Expected_Cards_per_Game", y="Actual_Cards_per_Game",
+                        size="Matches", hover_name="referee_name",
+                        title="Expected vs Actual Cards per Game",
+                    )
+                    max_v = max(referee_analysis["Expected_Cards_per_Game"].max(),
+                                referee_analysis["Actual_Cards_per_Game"].max())
+                    fig.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v,
+                                 line=dict(dash="dash", color="gray"))
+                    st.plotly_chart(fig, width="stretch")
+                    st.caption("Above the dashed line = stricter than expected this tournament.")
+
+            st.dataframe(referee_analysis.round(2), width="stretch", hide_index=True)
+
+    with tab_map["Venues & Referees"]:
+        safe_section("Venues & Referees", render_venues_referees)
+
+
+# ============================= MATCH FACTORS =============================
+if "Match Factors" in tab_map:
+    def render_match_factors():
+        section_header("What Actually Predicts Winning?")
+        st.caption("Pre-match factors (squad value, rest days, host status) compared against real results.")
+
+        mf = match_factors.copy()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if "value_difference_m" in mf.columns and "match_result" in mf.columns:
+                plot_df = mf.dropna(subset=["match_result"])
+                fig = px.box(plot_df, x="match_result", y="value_difference_m", color="match_result",
+                            title="Squad Value Gap (Home − Away, €M) vs Match Result",
+                            category_orders={"match_result": ["H", "D", "A"]},
+                            color_discrete_map={"H": GREEN, "D": GOLD, "A": RED})
+                fig.update_layout(xaxis_title="Result (H=Home win, D=Draw, A=Away win)")
+                st.plotly_chart(fig, width="stretch")
+                st.caption("If bigger spenders usually win, the 'H' box should sit above zero and "
+                           "'A' below zero.")
+        with c2:
+            if "rest_days_difference" in mf.columns and "match_result" in mf.columns:
+                plot_df = mf.dropna(subset=["match_result"])
+                fig = px.box(plot_df, x="match_result", y="rest_days_difference", color="match_result",
+                            title="Rest-Days Advantage (Home − Away) vs Match Result",
+                            category_orders={"match_result": ["H", "D", "A"]},
+                            color_discrete_map={"H": GREEN, "D": GOLD, "A": RED})
+                st.plotly_chart(fig, width="stretch")
+
+        if "home_is_host" in mf.columns and "match_result" in mf.columns:
+            section_header("Host Nation Advantage")
+            host_matches = mf[(mf["home_is_host"] == 1) & mf["match_result"].notna()]
+            if not host_matches.empty:
+                host_win_rate = (host_matches["match_result"] == "H").mean() * 100
+                overall_home_win_rate = (mf.dropna(subset=["match_result"])["match_result"] == "H").mean() * 100
+                c3, c4 = st.columns(2)
+                c3.metric("Host nations' home win rate", f"{host_win_rate:.0f}%")
+                c4.metric("All teams' home win rate", f"{overall_home_win_rate:.0f}%")
+
+        if "home_elo" in mf.columns and "away_elo" in mf.columns and "match_result" in mf.columns:
+            section_header("Elo Favorite vs Actual Result")
+            plot_df = mf.dropna(subset=["match_result"]).copy()
+            plot_df["elo_diff"] = plot_df["home_elo"] - plot_df["away_elo"]
+            fig = px.strip(plot_df, x="match_result", y="elo_diff", color="match_result",
+                           category_orders={"match_result": ["H", "D", "A"]},
+                           color_discrete_map={"H": GREEN, "D": GOLD, "A": RED},
+                           title="Elo Gap (Home − Away) vs Match Result")
+            fig.add_hline(y=0, line_dash="dash", line_color="gray")
+            st.plotly_chart(fig, width="stretch")
+            st.caption("Points below the line with an 'H' result (or above it with 'A') are upsets — "
+                       "the lower-Elo team won anyway.")
+
+        show_cols = [c for c in ["date", "home_team_name", "away_team_name", "value_difference_m",
+                                   "rest_days_difference", "home_is_host", "away_is_host", "match_result"]
+                     if c in mf.columns]
+        if show_cols:
+            st.dataframe(mf[show_cols].round(2), width="stretch", hide_index=True)
+
+    with tab_map["Match Factors"]:
+        safe_section("Match Factors", render_match_factors)
+
+
 # ================================= PLAYERS =================================
 if "Players" in tab_map:
     def render_players():
@@ -807,6 +955,36 @@ if "Players" in tab_map:
         show_cols = [c for c in ["player_name", "position", "Goals", "Assists",
                                    "Goal_Contributions", "Goals_per_90", "Minutes"] if c in top_players.columns]
         st.dataframe(top_players[show_cols].round(2), width='stretch', hide_index=True)
+
+        if "POTM_Awards" in ps.columns and ps["POTM_Awards"].sum() > 0:
+            section_header("Player of the Match Awards")
+            potm = ps[ps["POTM_Awards"] > 0].sort_values("POTM_Awards", ascending=False).head(15)
+            fig = px.bar(potm, x="player_name", y="POTM_Awards", color="POTM_Awards",
+                        title="Most Player of the Match Awards")
+            fig.update_layout(xaxis_tickangle=-40)
+            st.plotly_chart(fig, width="stretch")
+
+        if "age" in ps.columns:
+            section_header("Squad Age & Physicality")
+            c3, c4 = st.columns(2)
+            with c3:
+                fig = px.histogram(ps, x="age", nbins=20, color="position" if "position" in ps.columns else None,
+                                   title="Age Distribution")
+                st.plotly_chart(fig, width="stretch")
+            with c4:
+                if "height_cm" in ps.columns and "position" in ps.columns:
+                    fig = px.box(ps, x="position", y="height_cm", color="position",
+                                title="Height by Position")
+                    st.plotly_chart(fig, width="stretch")
+
+        if "club_team" in ps.columns:
+            section_header("Club Representation")
+            club_counts = ps["club_team"].value_counts().head(15).reset_index()
+            club_counts.columns = ["Club", "Players"]
+            fig = px.bar(club_counts, x="Club", y="Players", color="Players",
+                        title="Clubs with the Most Players at the Tournament")
+            fig.update_layout(xaxis_tickangle=-40)
+            st.plotly_chart(fig, width="stretch")
 
     with tab_map["Players"]:
         safe_section("Players", render_players)

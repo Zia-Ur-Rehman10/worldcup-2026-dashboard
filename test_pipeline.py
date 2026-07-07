@@ -61,4 +61,20 @@ print("Stage order:", sp.get("stage_order"))
 for p in sp.get("progression", []):
     print(f"  {p['stage']}: {p['teams']} teams, {p['matches']} matches, advancing={p['advancing_teams']}")
 
+print("\n--- Venue Analysis ---")
+va = result["venue_analysis"]
+print(va if not va.empty else "EMPTY")
+
+print("\n--- Referee Analysis ---")
+ra = result["referee_analysis"]
+print(ra if not ra.empty else "EMPTY")
+
+print("\n--- Match Factors ---")
+mf = result["match_factors"]
+print(mf[["match_id","value_difference_m","host_team_playing"]].head() if not mf.empty else "EMPTY")
+
+print("\n--- Player Summary (POTM) ---")
+psum2 = result["player_summary"]
+print(psum2[["player_name","POTM_Awards","Goals","Assists"]].sort_values("POTM_Awards", ascending=False).head() if not psum2.empty else "EMPTY")
+
 print("\nALL GOOD")
