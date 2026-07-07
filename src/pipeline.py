@@ -86,6 +86,14 @@ def build_master_matches(_dataframes: dict, version: str) -> pd.DataFrame:
     stages = d["tournament_stages"]
     referees = d["referees"]
 
+    # `venues.csv` and `referees.csv` can both carry a `country` column
+    # (venue country vs. referee's home country) — rename up front so a
+    # merge never silently collides them into ambiguous country_x/country_y.
+    venues = venues.rename(columns={"country": "venue_country"}) if "country" in venues.columns else venues
+    referees = referees.rename(columns={
+        c: f"referee_{c}" for c in ["country", "avg_cards_per_game", "name"] if c in referees.columns
+    })
+
     home_lookup = teams.rename(columns={
         "team_id": "home_team_id", "team_name": "home_team_name",
         "fifa_code": "home_fifa_code", "group_letter": "home_group",
@@ -110,14 +118,21 @@ def build_master_matches(_dataframes: dict, version: str) -> pd.DataFrame:
         .merge(referees, on="referee_id", how="left")
     )
 
-    # --- Guard against merge mismatches (e.g. a stale teams.csv missing a
-    # team_id that a newer matches.csv references) blowing up downstream
-    # string concatenation. Falling back to a clear placeholder instead of
-    # NaN means "Unknown Team" appears in a table rather than the whole
-    # pipeline crashing on `NaN + str`. ---
-    for col in ["home_team_name", "away_team_name"]:
-        if col in mm.columns and mm[col].isna().any():
-            mm[col] = mm[col].fillna("Unknown Team")
+    # --- Two distinct reasons a team name can be missing here, handled
+    # differently: (1) the fixture genuinely has no team assigned yet —
+    # a future knockout slot like "Winner of R16 Match 93" where
+    # home_team_id/away_team_id are null in the source data because that
+    # earlier match hasn't been played. That's normal — label it "TBD".
+    # (2) home_team_id/away_team_id IS set but didn't match anything in
+    # teams.csv (e.g. a stale teams.csv missing a newer team_id) — a real
+    # data problem, labeled "Unknown Team" so it's visibly different from
+    # a normal TBD bracket slot, and doesn't crash the string
+    # concatenation below (`NaN + str` would raise a TypeError). ---
+    for side in ["home", "away"]:
+        id_col, name_col = f"{side}_team_id", f"{side}_team_name"
+        if name_col in mm.columns and mm[name_col].isna().any():
+            missing = mm[name_col].isna()
+            mm.loc[missing, name_col] = np.where(mm.loc[missing, id_col].isna(), "TBD", "Unknown Team")
 
     # --- Played vs. upcoming: a real, live tournament's matches.csv mixes
     # completed results with future fixtures (NaN scores). Every stat below
@@ -365,11 +380,33 @@ def build_team_match_mart(master_matches: pd.DataFrame, match_stats: pd.DataFram
 # 5. EVENT MART (goals, cards, subs — for timelines)
 # ============================================================
 
+def _parse_minute(value) -> float:
+    """Handles both plain minutes ('45') and stoppage-time notation
+    ('90+6' -> 96.0). Real match-event data frequently uses '+' notation
+    for added time, which otherwise silently turns the whole column into
+    text and breaks every numeric comparison downstream."""
+    if pd.isna(value):
+        return np.nan
+    s = str(value).strip()
+    if "+" in s:
+        parts = s.split("+")
+        try:
+            return float(parts[0]) + float(parts[1])
+        except (ValueError, IndexError):
+            return np.nan
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
 @st.cache_data(show_spinner=False)
 def build_event_mart(match_events: pd.DataFrame, teams: pd.DataFrame, version: str) -> pd.DataFrame:
     events = match_events.copy()
     if "team_id" in events.columns:
         events = events.merge(teams[["team_id", "team_name"]], on="team_id", how="left")
+    if "minute" in events.columns:
+        events["minute"] = events["minute"].apply(_parse_minute)
     return events
 
 
@@ -685,46 +722,71 @@ def build_goal_timing(event_mart: pd.DataFrame, version: str) -> dict:
 # ============================================================
 
 @st.cache_data(show_spinner=False)
-def build_player_summary(dataframes: dict, event_mart: pd.DataFrame, version: str) -> pd.DataFrame:
-    if "squads_and_players" not in dataframes or "match_lineups" not in dataframes:
+def build_player_summary(dataframes: dict, event_mart: pd.DataFrame, master_matches: pd.DataFrame, version: str) -> pd.DataFrame:
+    if "squads_and_players" not in dataframes:
         return pd.DataFrame()
 
-    players = dataframes["squads_and_players"]
-    lineups = dataframes["match_lineups"]
+    players = dataframes["squads_and_players"].copy()
 
-    player_minutes = lineups.groupby("player_id").agg(
-        Matches=("match_id", "count"),
-        Starts=("is_starting_xi", "sum"),
-        Minutes=("minutes_played", "sum"),
-    ).reset_index()
+    # --- Bio enrichment: age from date_of_birth, if present ---
+    if "date_of_birth" in players.columns:
+        dob = pd.to_datetime(players["date_of_birth"], errors="coerce")
+        # Age as of the tournament (using today's date is fine either way —
+        # this is just for relative comparisons between players).
+        players["age"] = ((pd.Timestamp.now() - dob).dt.days / 365.25).round(1)
 
-    def count_event(event_type, out_name):
-        if "event_type" not in event_mart.columns or "player_id" not in event_mart.columns:
-            return pd.DataFrame(columns=["player_id", out_name])
-        return (
-            event_mart[event_mart["event_type"] == event_type]
-            .groupby("player_id").size().reset_index(name=out_name)
+    # --- Preferred path: player_stats.csv is the authoritative source for
+    # real per-tournament totals (goals, assists, cards, minutes...). Fall
+    # back to deriving from match_lineups/match_events only if it's absent
+    # (e.g. an older dataset snapshot). ---
+    if "player_stats" in dataframes:
+        stats = dataframes["player_stats"].copy()
+        rename_map = {
+            "matches_played": "Matches", "matches_started": "Starts",
+            "minutes_played": "Minutes", "goals": "Goals", "assists": "Assists",
+            "yellow_cards": "Yellow_Cards", "red_cards": "Red_Cards",
+            "penalty_goals": "Penalty_Goals", "own_goals": "Own_Goals",
+            "clean_sheets": "Clean_Sheets", "saves": "Saves",
+            "goals_conceded": "Goals_Conceded", "average_rating": "Average_Rating",
+        }
+        stats = stats.rename(columns={k: v for k, v in rename_map.items() if k in stats.columns})
+        # Avoid duplicate player_name/position columns from both sources
+        stats_cols = [c for c in stats.columns if c in ("player_id",) or c not in players.columns]
+        ps = players.merge(stats[stats_cols], on="player_id", how="left")
+    else:
+        lineups = dataframes.get("match_lineups")
+        if lineups is None:
+            return pd.DataFrame()
+
+        player_minutes = lineups.groupby("player_id").agg(
+            Matches=("match_id", "count"),
+            Starts=("is_starting_xi", "sum"),
+            Minutes=("minutes_played", "sum"),
+        ).reset_index()
+
+        def count_event(event_type, out_name):
+            if "event_type" not in event_mart.columns or "player_id" not in event_mart.columns:
+                return pd.DataFrame(columns=["player_id", out_name])
+            return (
+                event_mart[event_mart["event_type"] == event_type]
+                .groupby("player_id").size().reset_index(name=out_name)
+            )
+
+        ps = (
+            players
+            .merge(player_minutes, on="player_id", how="left")
+            .merge(count_event("Goal", "Goals"), on="player_id", how="left")
+            .merge(count_event("Assist", "Assists"), on="player_id", how="left")
+            .merge(count_event("Yellow Card", "Yellow_Cards"), on="player_id", how="left")
+            .merge(count_event("Red Card", "Red_Cards"), on="player_id", how="left")
         )
 
-    player_goals = count_event("Goal", "Goals")
-    player_assists = count_event("Assist", "Assists")
-    yellow_cards = count_event("Yellow Card", "Yellow_Cards")
-    red_cards = count_event("Red Card", "Red_Cards")
-
-    ps = (
-        players
-        .merge(player_minutes, on="player_id", how="left")
-        .merge(player_goals, on="player_id", how="left")
-        .merge(player_assists, on="player_id", how="left")
-        .merge(yellow_cards, on="player_id", how="left")
-        .merge(red_cards, on="player_id", how="left")
-    )
-
-    cols = ["Matches", "Starts", "Minutes", "Goals", "Assists", "Yellow_Cards", "Red_Cards"]
-    for c in cols:
+    numeric_cols = ["Matches", "Starts", "Minutes", "Goals", "Assists", "Yellow_Cards", "Red_Cards",
+                     "Penalty_Goals", "Own_Goals", "Clean_Sheets", "Saves", "Goals_Conceded"]
+    for c in numeric_cols:
         if c not in ps.columns:
             ps[c] = 0
-    ps[cols] = ps[cols].fillna(0)
+    ps[numeric_cols] = ps[numeric_cols].fillna(0)
 
     ps["Goals_per_90"] = np.where(ps["Minutes"] > 0, ps["Goals"] * 90 / ps["Minutes"], 0)
     ps["Assists_per_90"] = np.where(ps["Minutes"] > 0, ps["Assists"] * 90 / ps["Minutes"], 0)
@@ -738,6 +800,17 @@ def build_player_summary(dataframes: dict, event_mart: pd.DataFrame, version: st
         ps["Value_Efficiency"] = np.where(
             ps["Market_Value_M"] > 0, ps["Goal_Contributions"] / ps["Market_Value_M"], 0
         )
+
+    # --- Player of the Match awards, if the dataset tracks them ---
+    if "player_of_the_match_id" in master_matches.columns:
+        potm_counts = (
+            master_matches["player_of_the_match_id"].dropna()
+            .value_counts().rename_axis("player_id").reset_index(name="POTM_Awards")
+        )
+        ps = ps.merge(potm_counts, on="player_id", how="left")
+        ps["POTM_Awards"] = ps["POTM_Awards"].fillna(0).astype(int)
+    else:
+        ps["POTM_Awards"] = 0
 
     return ps
 
@@ -925,7 +998,10 @@ def build_stage_progression(master_matches: pd.DataFrame, version: str) -> dict:
     teams_by_stage = {}
     for stage in stage_order:
         stage_mm = mm[mm["stage_name"] == stage]
-        teams_by_stage[stage] = set(stage_mm["home_team_name"]).union(stage_mm["away_team_name"])
+        teams_by_stage[stage] = (
+            set(stage_mm["home_team_name"]).union(stage_mm["away_team_name"])
+            - {"TBD", "Unknown Team"}
+        )
 
     progression_rows = []
     for i, stage in enumerate(stage_order):
@@ -960,7 +1036,103 @@ def build_stage_progression(master_matches: pd.DataFrame, version: str) -> dict:
 
 
 # ============================================================
-# 16. ONE-CALL PIPELINE RUNNER
+# 16. VENUE GEOGRAPHY & ELEVATION ANALYSIS
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def build_venue_analysis(master_matches: pd.DataFrame, dataframes: dict, version: str) -> pd.DataFrame:
+    venues = dataframes.get("venues")
+    if venues is None or "latitude" not in venues.columns:
+        return pd.DataFrame()
+
+    mm = master_matches[master_matches.get("is_played", True) == True] \
+        if "is_played" in master_matches.columns else master_matches
+
+    if "stadium_name" not in mm.columns:
+        return pd.DataFrame()
+
+    agg = {"Matches": ("match_id", "count"), "Goals": ("total_goals", "sum")}
+    if "total_xg" in mm.columns:
+        agg["xG"] = ("total_xg", "sum")
+
+    venue_stats = mm.groupby("stadium_name").agg(**agg).reset_index()
+    venue_stats["Goals_per_Match"] = venue_stats["Goals"] / venue_stats["Matches"]
+
+    venue_cols = [c for c in ["stadium_name", "venue_country", "city", "capacity",
+                                "latitude", "longitude", "elevation_meters"] if c in venues.columns
+                  or c == "stadium_name"]
+    venues_renamed = venues.rename(columns={"country": "venue_country"}) if "country" in venues.columns else venues
+    venue_stats = venue_stats.merge(
+        venues_renamed[[c for c in venue_cols if c in venues_renamed.columns]],
+        on="stadium_name", how="left"
+    )
+
+    return venue_stats.sort_values("Goals_per_Match", ascending=False).reset_index(drop=True)
+
+
+# ============================================================
+# 17. REFEREE DISCIPLINE ANALYSIS
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def build_referee_analysis(master_matches: pd.DataFrame, event_mart: pd.DataFrame, version: str) -> pd.DataFrame:
+    mm = master_matches[master_matches.get("is_played", True) == True] \
+        if "is_played" in master_matches.columns else master_matches
+
+    ref_col = "referee_name" if "referee_name" in mm.columns else ("name" if "name" in mm.columns else None)
+    if ref_col is None or "referee_id" not in mm.columns:
+        return pd.DataFrame()
+
+    ref_stats = mm.groupby(ref_col).agg(
+        Matches=("match_id", "count"),
+        Goals_Officiated=("total_goals", "sum"),
+    ).reset_index().rename(columns={ref_col: "referee_name"})
+
+    if "referee_avg_cards_per_game" in mm.columns:
+        expected = mm.groupby(ref_col)["referee_avg_cards_per_game"].mean().reset_index()
+        expected.columns = ["referee_name", "Expected_Cards_per_Game"]
+        ref_stats = ref_stats.merge(expected, on="referee_name", how="left")
+
+    if "event_type" in event_mart.columns and "match_id" in event_mart.columns:
+        cards = event_mart[event_mart["event_type"].isin(["Yellow Card", "Red Card"])]
+        match_to_ref = mm[["match_id", ref_col]].rename(columns={ref_col: "referee_name"})
+        cards_with_ref = cards.merge(match_to_ref, on="match_id", how="left")
+        actual_cards = cards_with_ref.groupby("referee_name").size().reset_index(name="Actual_Cards")
+        ref_stats = ref_stats.merge(actual_cards, on="referee_name", how="left")
+        ref_stats["Actual_Cards"] = ref_stats["Actual_Cards"].fillna(0)
+        ref_stats["Actual_Cards_per_Game"] = ref_stats["Actual_Cards"] / ref_stats["Matches"]
+
+    return ref_stats.sort_values("Matches", ascending=False).reset_index(drop=True)
+
+
+# ============================================================
+# 18. PRE-MATCH FACTORS (squad value, rest days, host advantage)
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def build_match_factors(dataframes: dict, version: str) -> pd.DataFrame:
+    mpf = dataframes.get("match_prediction_features")
+    if mpf is None:
+        return pd.DataFrame()
+
+    mpf = mpf.copy()
+    if "home_squad_total_value_eur" in mpf.columns and "away_squad_total_value_eur" in mpf.columns:
+        mpf["value_difference_m"] = (mpf["home_squad_total_value_eur"] - mpf["away_squad_total_value_eur"]) / 1_000_000
+        mpf["higher_value_team_won"] = np.select(
+            [mpf["value_difference_m"] > 0, mpf["value_difference_m"] < 0],
+            [mpf.get("match_result") == "H", mpf.get("match_result") == "A"],
+            default=np.nan,
+        )
+    if "home_rest_days" in mpf.columns and "away_rest_days" in mpf.columns:
+        mpf["rest_days_difference"] = mpf["home_rest_days"] - mpf["away_rest_days"]
+    if "home_is_host" in mpf.columns:
+        mpf["host_team_playing"] = (mpf["home_is_host"] == 1) | (mpf.get("away_is_host", 0) == 1)
+
+    return mpf
+
+
+# ============================================================
+# 19. ONE-CALL PIPELINE RUNNER
 # ============================================================
 
 def run_pipeline(raw_path: str):
@@ -994,10 +1166,13 @@ def run_pipeline(raw_path: str):
     team_summary_v2 = build_team_summary_v2(team_match_mart, dataframes["teams"], version)
     match_summary = build_match_summary(played_matches, dataframes["match_team_stats"], version)
     goal_timing = build_goal_timing(event_mart, version)
-    player_summary = build_player_summary(dataframes, event_mart, version)
+    player_summary = build_player_summary(dataframes, event_mart, master_matches, version)
     advanced_insights = build_advanced_insights(played_matches, team_summary_v2, team_match_mart, event_mart, version)
     group_standings = build_group_standings(played_matches, version)
     stage_progression = build_stage_progression(master_matches, version)
+    venue_analysis = build_venue_analysis(master_matches, dataframes, version)
+    referee_analysis = build_referee_analysis(master_matches, event_mart, version)
+    match_factors = build_match_factors(dataframes, version)
 
     return {
         "version": version,
@@ -1016,4 +1191,7 @@ def run_pipeline(raw_path: str):
         "advanced_insights": advanced_insights,
         "group_standings": group_standings,
         "stage_progression": stage_progression,
+        "venue_analysis": venue_analysis,
+        "referee_analysis": referee_analysis,
+        "match_factors": match_factors,
     }
